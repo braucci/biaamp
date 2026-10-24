@@ -1,0 +1,16 @@
+   # Costruzione
+   build/
+   dist/
+   build.log
+   .venv/
+   *.egg-info/
+
+   # Python
+   __pycache__/
+   *.py[cod]
+
+   # macOS
+   .DS_Store
+
+   # Banco di prova
+   test/anteprime/
