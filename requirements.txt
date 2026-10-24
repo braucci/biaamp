@@ -1,0 +1,5 @@
+pyobjc-core>=11.1
+pyobjc-framework-Cocoa>=11.1
+pyobjc-framework-WebKit>=11.1
+pyobjc-framework-MediaPlayer>=11.1
+py2app>=0.28.8
