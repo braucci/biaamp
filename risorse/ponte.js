@@ -84,6 +84,19 @@
 
   function presa() { return window.__biaPresa || null; }
 
+  // ── Volume: una sola scala, quella del cursore di YouTube Music ─────────
+  // updateVolume(a) della barra salva il valore del cursore a nello store
+  // (player.volume) e passa al lettore il guadagno esponenziale
+  //   g(a) = 2^(0,03917·a + 2,82823) − 7,13431   (limitato a 0…100)
+  // (funzione Kfb, opzione music_web_enable_exponential_volume_control).
+  // Rileggere getVolume() darebbe g(a): il cursore di BiaAmp tornerebbe
+  // indietro (42 → 15). Si legge e si scrive quindi sullo stesso livello: lo
+  // store se è leggibile, altrimenti il lettore (setVolume/getVolume, lineari).
+  function volumeCursore(b) {
+    var a = prova(function () { return b.getState().player.volume; }, null);
+    return (typeof a === 'number' && isFinite(a)) ? a : null;
+  }
+
   function leggiViz(modo, v) {
     var p = presa();
     if ((modo !== 'f' && modo !== 'w') || !v || v.paused || !p) { return ''; }
@@ -98,7 +111,8 @@
     var st = prova(function () { return p.getPlayerState(); }, -1);
     var cur = prova(function () { return p.getCurrentTime(); }, 0);
     var dur = prova(function () { return p.getDuration(); }, 0);
-    var vol = prova(function () { return p.getVolume(); }, -1);
+    var vol = volumeCursore(b);
+    if (vol === null) { vol = prova(function () { return p.getVolume(); }, -1); }
     var muto = prova(function () { return p.isMuted(); }, false);
     if (v) {
       if (!numero(cur)) { cur = v.currentTime; }
@@ -201,7 +215,8 @@
       case 'seek':     if (!p) { return false; } p.seekTo(Math.max(0, Number(arg) || 0), true); return true;
       case 'volume': {
         var x = Math.max(0, Math.min(100, Math.round(Number(arg) || 0)));
-        if (b && b.updateVolume) { b.updateVolume(x); } else if (p) { p.setVolume(x); } else { return false; }
+        if (b && b.updateVolume && volumeCursore(b) !== null) { b.updateVolume(x); }    // scala del cursore
+        else if (p) { p.setVolume(x); } else { return false; }                          // scala del lettore
         if (x > 0 && p && p.isMuted && p.isMuted()) { p.unMute(); }
         return true;
       }
@@ -522,7 +537,7 @@
   }
 
   window.__bia = {
-    versione: '1.3.2',
+    versione: '1.4.2',
     stato: function (modo) { return JSON.stringify(stato(modo)); },
     coda: function (firma) { return JSON.stringify(coda(firma)); },
     cmd: function (nome, arg) { try { return !!cmd(nome, arg); } catch (e) { return false; } },
