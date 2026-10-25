@@ -22,6 +22,13 @@
  *      Blackman, modulo / N, scala in dB tra minDecibels e maxDecibels).
  * L'audio udibile non viene toccato in alcun modo.
  *
+ * SESSIONI LUNGHE (1.4.1). YouTube Music riusa lo stesso SourceBuffer da un
+ * brano all'altro. Se un segmento viene interrotto (salto di brano: abort()) o
+ * rifiutato (buffer pieno: appendBuffer lancia un'eccezione e il lettore lo
+ * ripete), i byte in sospeso non devono saldarsi ai successivi: la presa si
+ * azzera come l'analizzatore del browser, ignora i dati rifiutati e, se
+ * comunque perde l'allineamento, si riaggancia al riquadro 'moof' successivo.
+ *
  * © 2026 B. Raucci — Licenza MIT
  */
 (function () {
@@ -30,11 +37,14 @@
 
   var FS = 48000, N = 2048, MIN_DB = -90, MAX_DB = -20;
   var MAX_BLOCCHI = 40;
-  var stato = { mime: '', segmenti: 0, decodificati: 0, errore: '', metodo: '', blocchi: [] };
+  var stato = { mime: '', segmenti: 0, decodificati: 0, errore: '', metodo: '', blocchi: [],
+                riagganci: 0, manca: '' };
   var presi = new WeakMap();          // SourceBuffer audio → stato della presa
   var urlSorgenti = {};               // blob URL → MediaSource
   var ordineUrl = [];
   var decoder = null;
+  var ultimoVideo = null;             // il <video> che il ponte fa analizzare
+  var sequenza = 0;                   // ordine di arrivo dei blocchi
 
   // ── utilità ──────────────────────────────────────────────────────────────
   function contestoDecodifica() {
@@ -226,8 +236,9 @@
       var d = ab.getChannelData(c);
       for (var i = 0; i < n; i++) { mono[i] += d[i] / canali; }
     }
-    stato.blocchi.push({ ms: ms, t0: t0, fs: ab.sampleRate, dati: mono });
+    stato.blocchi.push({ ms: ms, t0: t0, fs: ab.sampleRate, dati: mono, n: ++sequenza, arrivo: Date.now() });
     stato.decodificati++;
+    stato.errore = '';                // la diagnosi descrive il presente, non un guasto passato
     pota();
   }
 
@@ -305,11 +316,35 @@
   // MP4: i byte si accumulano e si elaborano solo i riquadri completi, quindi
   // un segmento consegnato in più pezzi (protocollo SABR) viene ricomposto.
   // Il tempo viene da tfdt / scala + timestampOffset, non dal buffer.
+  //
+  // Un'intestazione è credibile solo se il tipo è uno dei riquadri di primo
+  // livello di un MP4 frammentato e la dimensione è plausibile per l'audio (un
+  // frammento di 10 s a 256 kbit/s occupa circa 320 kB). Altrimenti
+  // l'allineamento è perso: senza questo controllo quattro byte qualsiasi letti
+  // come «dimensione» (fino a 4 GB) facevano attendere la presa per sempre.
   var ACCUMULO_MAX = 16 * 1024 * 1024;
+  var RIQUADRO_MAX = 4 * 1024 * 1024;
+  var TIPI_MP4 = /^(ftyp|styp|moov|moof|mdat|sidx|ssix|emsg|prft|free|skip|uuid|mfra|meta|pdin)$/;
+
+  function azzera(st) { st.accumulo = null; st.moof = null; st.attesa = null; st.prima = null; }
+
+  // Primo riquadro 'moof', 'ftyp', 'styp' o 'moov' con dimensione plausibile
+  // che inizia da 'da' in poi; -1 se non c'è.
+  function riaggancio(a, da) {
+    for (var i = da + 4; i + 4 <= a.length; i++) {
+      var c = a[i];
+      if (c !== 0x6D && c !== 0x66 && c !== 0x73) { continue; }       // m, f, s
+      var t = tipo4(a, i);
+      if (t !== 'moof' && t !== 'ftyp' && t !== 'styp' && t !== 'moov') { continue; }
+      var dim = u32(a, i - 4);
+      if (dim >= 8 && dim <= RIQUADRO_MAX) { return i - 4; }
+    }
+    return -1;
+  }
 
   function riceviMp4(st, sb, u) {
     var a = st.accumulo ? unisci(st.accumulo, u) : u, p = 0;
-    if (a.length > ACCUMULO_MAX) { st.accumulo = null; stato.errore = 'flusso MP4 non interpretabile'; return; }
+    if (a.length > ACCUMULO_MAX) { azzera(st); st.perso = true; return; }
     while (p + 8 <= a.length) {
       var dim = u32(a, p), t = tipo4(a, p + 4), testa = 8;
       if (dim === 1) {
@@ -317,8 +352,19 @@
         dim = u32(a, p + 8) * 4294967296 + u32(a, p + 12);
         testa = 16;
       }
-      if (dim < testa) { st.accumulo = null; stato.errore = 'riquadro MP4 non valido (' + t + ')'; return; }
+      if (!TIPI_MP4.test(t) || dim < testa || dim > RIQUADRO_MAX) {   // allineamento perso
+        if (!st.perso) { st.perso = true; stato.riagganci++; }
+        st.moof = null;
+        var q = riaggancio(a, p + 1);
+        if (q < 0) {                  // tengo la coda: la firma può essere a cavallo di due pezzi
+          st.accumulo = a.slice(Math.max(p + 1, a.length - 7));
+          return;
+        }
+        p = q;
+        continue;
+      }
       if (p + dim > a.length) { break; }                      // incompleto: aspetto altri byte
+      st.perso = false;
       var r = a.subarray(p, p + dim);
       if (t === 'ftyp') {
         st.ftyp = new Uint8Array(r);
@@ -363,14 +409,36 @@
     elabora(st, new Uint8Array(parti.media), t0);
   }
 
+  // Il <video> del lettore: quello che il ponte fa analizzare o, prima della
+  // prima analisi, quello principale di YouTube. Non il primo del documento,
+  // che può essere un'anteprima o un annuncio con un istante tutto suo.
+  function videoLettore() {
+    return ultimoVideo || document.querySelector('video.html5-main-video') || document.querySelector('video');
+  }
+
+  // Tiene i blocchi utili. Del brano in ascolto (MediaSource collegato al video)
+  // si scartano quelli finiti da più di 15 s, salvo se appena arrivati: il
+  // lettore può accodare un brano e solo dopo spostare l'istante di ascolto.
+  // Quelli di altri brani restano finché c'è posto. Oltre MAX_BLOCCHI si
+  // sacrificano prima i blocchi di altri brani (i più vecchi), poi quelli più
+  // lontani dall'istante di ascolto.
   function pota() {
-    var v = document.querySelector('video'), t = v ? v.currentTime : 0;
+    var v = videoLettore(), t = v ? v.currentTime : 0, ms = v ? sorgenteDi(v) : null, ora = Date.now();
+    var corrente = function (b) { return !ms || b.ms === ms; };
     stato.blocchi = stato.blocchi.filter(function (b) {
-      var fine = b.t0 + b.dati.length / b.fs;
-      return fine > t - 15 && b.t0 < t + 600;
+      if (!corrente(b)) { return true; }
+      return b.t0 + b.dati.length / b.fs > t - 15 || ora - b.arrivo < 20000;
     });
+    if (stato.blocchi.length > MAX_BLOCCHI) {
+      var peso = function (b) {
+        if (!corrente(b)) { return 1e12 + (sequenza - b.n); }
+        var fine = b.t0 + b.dati.length / b.fs;
+        return Math.max(0, b.t0 - t, t - fine);
+      };
+      stato.blocchi.sort(function (a, b) { return peso(a) - peso(b); });
+      stato.blocchi.length = MAX_BLOCCHI;
+    }
     stato.blocchi.sort(function (a, b) { return a.t0 - b.t0; });
-    while (stato.blocchi.length > MAX_BLOCCHI) { stato.blocchi.shift(); }
   }
 
   // ── intercettazione (passiva) di MediaSource e SourceBuffer ─────────────
@@ -387,28 +455,81 @@
       try {
         if (/^audio\//i.test(String(tipo)) && !presi.has(sb)) {
           presi.set(sb, { ms: this, init: null, attesa: null, prima: null, contenitore: '', metodo: '', aac: null,
-                          mp4: /^audio\/mp4/i.test(String(tipo)), accumulo: null, ftyp: null, moof: null, scala: 0 });
+                          mp4: /^audio\/mp4/i.test(String(tipo)), accumulo: null, ftyp: null, moof: null, scala: 0,
+                          perso: false });
           stato.mime = String(tipo);
           sb.addEventListener('updateend', function () {
             try { concluso(sb); } catch (e) { stato.errore = 'updateend: ' + nomeErrore(e); }
           });
+          // Errore di decodifica nel browser: il suo analizzatore si azzera, la presa pure.
+          sb.addEventListener('error', function () { var st = presi.get(sb); if (st) { azzera(st); } });
         }
       } catch (e) { stato.errore = 'addSourceBuffer: ' + nomeErrore(e); }
       return sb;
     };
   }
 
+  // I dati entrano nella presa solo se il browser li ha accettati: un
+  // appendBuffer che lancia (buffer pieno) verrà ripetuto dal lettore, e
+  // contarlo due volte salderebbe un pezzo a se stesso.
   function suAppendBuffer(originale) {
     return function (dati) {
-      var st = presi.get(this);
+      var st = presi.get(this), copiati = null, prima = null;
       if (st) {
         try {
-          if (st.mp4) { riceviMp4(st, this, copia(dati)); }       // MP4: subito, tempo da tfdt
-          else { st.attesa = copia(dati); st.prima = intervalli(this.buffered); }   // WebM: a updateend
-        } catch (e) { st.attesa = null; stato.errore = 'appendBuffer: ' + nomeErrore(e); }
+          copiati = copia(dati);
+          if (!st.mp4) { prima = intervalli(this.buffered); }
+        } catch (e) { copiati = null; stato.errore = 'appendBuffer: ' + nomeErrore(e); }
+        if (!st.mp4) { st.attesa = copiati; st.prima = prima; }    // WebM: elaborato a updateend
       }
-      try { return originale.apply(this, arguments); }
-      catch (e) { if (st) { st.attesa = null; } throw e; }
+      var risultato;
+      try { risultato = originale.apply(this, arguments); }
+      catch (e) { if (st) { st.attesa = null; st.prima = null; } throw e; }
+      if (st && st.mp4 && copiati) {                                // MP4: subito, tempo da tfdt
+        try { riceviMp4(st, this, copiati); }
+        catch (e) { azzera(st); stato.errore = 'appendBuffer: ' + nomeErrore(e); }
+      }
+      return risultato;
+    };
+  }
+
+  // abort() azzera l'analizzatore del browser (salto di brano, ricerca nel
+  // brano): i byte di un segmento interrotto non arriveranno più.
+  function suAbort(originale) {
+    return function () {
+      var st = presi.get(this);
+      if (st) { azzera(st); }
+      return originale.apply(this, arguments);
+    };
+  }
+
+  // remove(inizio, fine): il lettore libera un tratto del buffer; i blocchi
+  // interamente compresi non verranno più riprodotti.
+  function suRemove(originale) {
+    return function (inizio, fine) {
+      var risultato = originale.apply(this, arguments);
+      var st = presi.get(this);
+      if (st && typeof inizio === 'number' && typeof fine === 'number') {
+        stato.blocchi = stato.blocchi.filter(function (b) {
+          return b.ms !== st.ms || b.t0 < inizio || b.t0 + b.dati.length / b.fs > fine;
+        });
+      }
+      return risultato;
+    };
+  }
+
+  // changeType(): stesso SourceBuffer, formato nuovo; seguirà un nuovo init.
+  function suChangeType(originale) {
+    return function (tipo) {
+      var risultato = originale.apply(this, arguments);
+      var st = presi.get(this);
+      if (st) {
+        azzera(st);
+        st.init = null; st.ftyp = null; st.scala = 0; st.aac = null; st.metodo = ''; st.contenitore = '';
+        st.mp4 = /^audio\/mp4/i.test(String(tipo));
+        stato.mime = String(tipo);
+      }
+      return risultato;
     };
   }
 
@@ -429,8 +550,13 @@
   try {
     if (window.MediaSource) { avvolgi(window.MediaSource.prototype, 'addSourceBuffer', suAddSourceBuffer); }
     if (window.ManagedMediaSource) { avvolgi(window.ManagedMediaSource.prototype, 'addSourceBuffer', suAddSourceBuffer); }
-    if (window.SourceBuffer) { avvolgi(window.SourceBuffer.prototype, 'appendBuffer', suAppendBuffer); }
-    if (window.ManagedSourceBuffer) { avvolgi(window.ManagedSourceBuffer.prototype, 'appendBuffer', suAppendBuffer); }
+    [window.SourceBuffer, window.ManagedSourceBuffer].forEach(function (C) {
+      if (!C) { return; }
+      avvolgi(C.prototype, 'appendBuffer', suAppendBuffer);
+      avvolgi(C.prototype, 'abort', suAbort);
+      avvolgi(C.prototype, 'remove', suRemove);
+      avvolgi(C.prototype, 'changeType', suChangeType);
+    });
     if (window.URL) { avvolgi(window.URL, 'createObjectURL', suCreateObjectURL); }
   } catch (e) { stato.errore = 'installazione: ' + nomeErrore(e); }
 
@@ -442,12 +568,18 @@
   }
 
   function finestra(v, n) {
-    var t = v.currentTime, ms = sorgenteDi(v), blocco = null;
+    ultimoVideo = v;
+    var t = v.currentTime, ms = sorgenteDi(v), blocco = null, propri = 0;
     for (var i = stato.blocchi.length - 1; i >= 0; i--) {
       var b = stato.blocchi[i];
       if (ms && b.ms !== ms) { continue; }
-      if (t >= b.t0 && t < b.t0 + b.dati.length / b.fs) { blocco = b; break; }
+      propri++;
+      // a parità di copertura vale il blocco arrivato per ultimo (brano nuovo
+      // caricato sugli stessi istanti di uno vecchio)
+      if (t >= b.t0 && t < b.t0 + b.dati.length / b.fs && (!blocco || b.n > blocco.n)) { blocco = b; }
     }
+    // Perché manca l'analisi: nessun blocco del brano, o blocchi che non coprono l'istante.
+    stato.manca = blocco ? '' : (propri ? 'blocchi ' + propri + ' fuori tempo' : 'nessun blocco');
     if (!blocco) { return null; }
     var fine = Math.floor((t - blocco.t0) * blocco.fs), inizio = fine - n + 1, x = new Float32Array(n);
     for (var k = 0; k < n; k++) {
@@ -532,11 +664,13 @@
       if (!stato.mime) { return 'nessun flusso audio intercettato'; }
       var d = stato.mime.split(';')[0] + ' · seg ' + stato.segmenti + ' · dec ' + stato.decodificati;
       if (stato.metodo) { d += ' · ' + stato.metodo; }
+      if (stato.riagganci) { d += ' · riagganci ' + stato.riagganci; }
+      if (stato.manca) { d += ' · ' + stato.manca; }
       if (stato.errore) { d += ' · ' + stato.errore; }
       return d;
     },
     _prova: { inizioNuovo: inizioNuovo, separa: separa, fft: fft, spettroByte: spettroByte, ondaByte: ondaByte,
               configurazioneAac: configurazioneAac, fotogrammi: fotogrammi, adts: adts, stato: stato,
-              scalaTempi: scalaTempi, tempoBase: tempoBase }
+              scalaTempi: scalaTempi, tempoBase: tempoBase, riaggancio: riaggancio }
   };
 })();
