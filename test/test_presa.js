@@ -53,10 +53,17 @@ function ambiente(opzioni) {
   class TimeRanges { constructor(r) { this.r = r; } get length() { return this.r.length; }
     start(i) { return this.r[i][0]; } end(i) { return this.r[i][1]; } }
   class SourceBuffer {
-    constructor() { this.intervalli = []; this.ev = []; }
+    constructor() { this.intervalli = []; this.ev = []; this.altri = {}; this.abort_ = 0; }
     get buffered() { return new TimeRanges(this.intervalli.map((x) => x.slice())); }
-    addEventListener(n, f) { if (n === 'updateend') this.ev.push(f); }
+    addEventListener(n, f) { if (n === 'updateend') this.ev.push(f); else (this.altri[n] = this.altri[n] || []).push(f); }
+    emetti(n) { (this.altri[n] || []).forEach((f) => f()); }
+    abort() { this.abort_++; }                                   // azzera l'analizzatore del browser
+    remove() {}
     appendBuffer() {
+      if (ambienteCorrente.quota > 0) {                         // QuotaExceededError: dati rifiutati
+        ambienteCorrente.quota--;
+        const e = new Error('quota'); e.name = 'QuotaExceededError'; throw e;
+      }
       const d = ambienteCorrente.prossimaDurata.shift();
       if (d) {
         const fine = this.intervalli.length ? this.intervalli[0][1] : ambienteCorrente.t0Iniziale;
@@ -75,17 +82,21 @@ function ambiente(opzioni) {
       const eWebm = u[0] === 0x1A && u[1] === 0x45;
       decodificati.push(eAdts ? 'adts' : eWebm ? 'webm' : 'mp4');
       if (!eAdts && !eWebm && opzioni.rifiutaMp4) { ko({ name: 'EncodingError' }); return; }
+      if (ambienteCorrente.guasti > 0) { ambienteCorrente.guasti--; ko({ name: 'EncodingError' }); return; }
       const durata = 4, n = durata * this.sampleRate, f = ambienteCorrente.frequenza;
       const dati = Float32Array.from({ length: n }, (_, i) => 0.5 * Math.sin(2 * Math.PI * f * i / this.sampleRate));
       ok({ length: n, numberOfChannels: 2, sampleRate: this.sampleRate, getChannelData: () => dati });
     }
   }
   const video = { currentTime: 0, src: '', currentSrc: '', srcObject: null };
+  // Un secondo <video> che precede quello del lettore nel documento (anteprime, annunci…).
+  const esca = opzioni.esca ? { currentTime: opzioni.esca, src: '', currentSrc: '', srcObject: null } : null;
   let contatoreUrl = 0;
   const window = { MediaSource, SourceBuffer, OfflineAudioContext,
                    URL: { createObjectURL: () => 'blob:biaamp/' + (++contatoreUrl) } };
-  const document = { querySelector: (s) => (s === 'video' ? video : null) };
-  const ambienteCorrente = { prossimaDurata: [], t0Iniziale: 0, frequenza: 1000, window, video, decodificati, listener };
+  const document = { querySelector: (s) => (s === 'video.html5-main-video' ? video : s === 'video' ? (esca || video) : null) };
+  const ambienteCorrente = { prossimaDurata: [], t0Iniziale: 0, frequenza: 1000, quota: 0, guasti: 0,
+                             window, video, decodificati, listener };
   new Function('window', 'document', sorgente)(window, document);
   return ambienteCorrente;
 }
@@ -211,4 +222,136 @@ A.prossimaDurata.push(4);
 sbv.appendBuffer(Uint8Array.from([...init, ...fr]));
 assert.deepStrictEqual(A.decodificati, ['webm']);
 console.log('✓ i SourceBuffer video sono ignorati');
+
+// ── Robustezza nelle sessioni lunghe (1.4.1) ────────────────────────────────
+// Un SourceBuffer audio che YouTube Music riusa da un brano all'altro, con
+// istanti in secondi assoluti grazie a timestampOffset.
+function sessione(opzioni = {}) {
+  const A = ambiente(Object.assign({ rifiutaMp4: true }, opzioni));
+  const W = A.window, ms = new W.MediaSource();
+  A.video.src = A.video.currentSrc = W.URL.createObjectURL(ms);
+  const sb = W.MediaSource.prototype.addSourceBuffer.call(ms, 'audio/mp4; codecs="mp4a.40.2"');
+  return { A, W, ms, sb, presa: W.__biaPresa, istanti: () => W.__biaPresa._prova.stato.blocchi.map((b) => b.t0) };
+}
+const brano = (...secondi) => Uint8Array.from([...init, ...secondi.flatMap((t) => Array.from(frammento(CAMPIONI, t)))]);
+
+// 9. Salto di brano a metà segmento: abort() e un brano nuovo nello stesso buffer.
+//    Senza azzeramento, i byte del segmento interrotto si saldano al brano nuovo:
+//    la ricomposizione perde l'allineamento e la presa resta ferma per sempre.
+let S = sessione();
+S.sb.appendBuffer(brano(0, 4));
+const interrotto = frammento(CAMPIONI, 8);
+S.sb.appendBuffer(interrotto.subarray(0, 40));                 // il segmento arriva a metà…
+S.sb.abort();                                                   // …e l'utente passa al brano dopo
+S.sb.timestampOffset = 1000;
+S.sb.appendBuffer(brano(0, 4));
+S.A.video.currentTime = 1002;
+assert.deepStrictEqual(S.istanti().filter((t) => t >= 1000), [1000, 1004], 'dopo abort: ' + S.istanti() + ' · ' + S.presa.diagnosi());
+assert.ok(S.presa.spettro(S.A.video), 'analisi del brano nuovo dopo abort()');
+assert.ok(!/riagganci/.test(S.presa.diagnosi()), 'abort() è un azzeramento, non un guasto: ' + S.presa.diagnosi());
+console.log('✓ abort() a metà segmento: il brano successivo è analizzato (' + S.presa.diagnosi() + ')');
+
+// 10. Buffer pieno: appendBuffer rifiuta un pezzo (QuotaExceededError) e il lettore lo
+//     ripete. I dati rifiutati non devono entrare nella ricomposizione.
+S = sessione();
+const pezzi = [];
+const f2 = brano(0, 4, 8);
+for (let i = 0; i < f2.length; i += 50) pezzi.push(f2.subarray(i, i + 50));
+pezzi.forEach((p, i) => {
+  if (i === 3) {
+    S.A.quota = 1;
+    assert.throws(() => S.sb.appendBuffer(p), /quota/);          // rifiutato…
+  }
+  S.sb.appendBuffer(p);                                         // …e ripetuto
+});
+assert.deepStrictEqual(S.istanti(), [0, 4, 8], 'pezzo ripetuto: ' + S.istanti() + ' · ' + S.presa.diagnosi());
+console.log('✓ pezzo rifiutato per buffer pieno e ripetuto: nessuna saldatura (' + S.presa.diagnosi() + ')');
+
+// 11. Allineamento perso per qualunque altra causa: la presa si riaggancia al
+//     riquadro successivo invece di attendere un «riquadro» di gigabyte.
+S = sessione();
+S.sb.appendBuffer(brano(0));
+S.sb.appendBuffer(Uint8Array.from([0x7F, 0xFF, 0xFF, 0xF0, 0x41, 0x42, 0x43, 0x44, 1, 2, 3]));   // spazzatura
+S.sb.appendBuffer(frammento(CAMPIONI, 4));
+S.sb.appendBuffer(frammento(CAMPIONI, 8));
+assert.deepStrictEqual(S.istanti(), [0, 4, 8], 'riaggancio: ' + S.istanti() + ' · ' + S.presa.diagnosi());
+assert.ok(/riagganci 1/.test(S.presa.diagnosi()), S.presa.diagnosi());
+// spazzatura con dimensione minuscola (prima: errore permanente e pezzo scartato)
+S.sb.appendBuffer(Uint8Array.from([0, 0, 0, 3, 0x6D, 0x6F, 0x6F, 0x66, ...frammento(CAMPIONI, 12)]));
+assert.deepStrictEqual(S.istanti(), [0, 4, 8, 12], 'riaggancio 2: ' + S.istanti());
+S.A.video.currentTime = 13;
+assert.ok(S.presa.spettro(S.A.video) && !/non valido|non interpretabile/.test(S.presa.diagnosi()), S.presa.diagnosi());
+// tipo noto ma dimensione impossibile: attenderebbe 2 GB
+S.sb.appendBuffer(Uint8Array.from([0x7F, 0xFF, 0xFF, 0xF0, ...Buffer.from('mdat'), ...frammento(CAMPIONI, 16)]));
+// dimensione plausibile ma tipo ignoto: inghiottirebbe il frammento che segue
+S.sb.appendBuffer(Uint8Array.from([0, 0, 1, 0, ...Buffer.from('ABCD'), ...frammento(CAMPIONI, 20), ...frammento(CAMPIONI, 24)]));
+assert.deepStrictEqual(S.istanti().filter((t) => t >= 16), [16, 20, 24], 'riaggancio 3: ' + S.istanti());
+console.log('✓ riaggancio dopo dati incoerenti (' + S.presa.diagnosi() + ')');
+
+// 11 bis. Firma del riquadro spezzata tra due pezzi durante il riaggancio.
+S = sessione();
+S.sb.appendBuffer(brano(0));
+const dopo = frammento(CAMPIONI, 4);
+S.sb.appendBuffer(Uint8Array.from([0x7F, 0xFF, 0xFF, 0xF0, 9, 9, ...dopo.subarray(0, 6)]));   // «mo» qui…
+S.sb.appendBuffer(dopo.subarray(6));                                                           // …«of» qui
+assert.deepStrictEqual(S.istanti(), [0, 4], 'firma spezzata: ' + S.istanti());
+console.log('✓ riaggancio con la firma «moof» divisa tra due pezzi');
+
+// 12. Un altro <video> prima di quello del lettore: la potatura dei blocchi deve
+//     usare l'istante del lettore, non quello del primo <video> del documento.
+S = sessione({ esca: 477 });
+S.sb.appendBuffer(brano(0, 4));
+S.A.video.currentTime = 2;
+const adesso = Date.now;
+Date.now = () => adesso() + 60000;                              // un minuto dopo: blocchi non più «appena arrivati»
+try { S.sb.appendBuffer(frammento(CAMPIONI, 8)); } finally { Date.now = adesso; }
+assert.deepStrictEqual(S.istanti(), [0, 4, 8], 'con un <video> esca a 477 s: ' + S.istanti());
+assert.ok(S.presa.spettro(S.A.video));
+console.log('✓ potatura sull\'istante del lettore anche con un secondo <video> nel documento');
+
+// 13. Limite di 40 blocchi: si sacrificano prima i blocchi di altri brani
+//     (altri MediaSource), poi quelli più lontani dall'istante di ascolto.
+S = sessione();
+S.sb.appendBuffer(init);
+for (let t = 0; t < 160; t += 4) S.sb.appendBuffer(frammento(CAMPIONI, t));   // 40 blocchi del brano 1
+const ms3 = new S.W.MediaSource();
+S.A.video.src = S.A.video.currentSrc = S.W.URL.createObjectURL(ms3);
+const sb3 = S.W.MediaSource.prototype.addSourceBuffer.call(ms3, 'audio/mp4; codecs="mp4a.40.2"');
+sb3.appendBuffer(brano(0, 4));                                                    // brano 2
+S.A.video.currentTime = 2;
+assert.ok(S.presa.spettro(S.A.video), 'brano 2 dopo 40 blocchi del brano 1');
+const blocchiMs3 = S.presa._prova.stato.blocchi.filter((b) => b.ms === ms3).length;
+assert.strictEqual(blocchiMs3, 2);
+assert.ok(S.presa._prova.stato.blocchi.length <= 40);
+console.log('✓ limite dei blocchi: restano quelli del brano in ascolto');
+
+// 13 bis. Stesso buffer, brano nuovo sugli stessi istanti (timestampOffset 0):
+//     vale il blocco più recente; remove() toglie i blocchi del tratto liberato.
+S = sessione();
+S.sb.appendBuffer(brano(1, 5));                                 // brano 1 a 1 kHz: [1, 5) e [5, 9)
+S.A.frequenza = 3000;
+S.sb.appendBuffer(brano(0));                                    // brano 2 a 3 kHz: [0, 4), sovrapposto
+S.A.video.currentTime = 2;
+assert.ok(Math.abs(picco(S.presa.spettro(S.A.video)) - 128) <= 1, 'vale il blocco più recente');
+S.sb.remove(0, Infinity);
+assert.deepStrictEqual(S.istanti(), [], 'remove(0, ∞) svuota i blocchi del buffer');
+console.log('✓ blocchi sovrapposti: vale il più recente; remove() li toglie anche dalla presa');
+
+// 14. Diagnosi: dice perché manca l'analisi (nessun blocco o blocchi fuori tempo).
+S = sessione();
+S.sb.appendBuffer(brano(0));
+S.A.video.currentTime = 30;
+assert.strictEqual(S.presa.spettro(S.A.video), null);
+assert.ok(/fuori tempo/.test(S.presa.diagnosi()), S.presa.diagnosi());
+console.log('✓ diagnosi esplicativa:', S.presa.diagnosi());
+
+// 15. Un errore passeggero non resta nella diagnosi dopo che la presa è ripartita.
+S = sessione();
+S.sb.appendBuffer(init);
+S.A.guasti = 1;
+S.sb.appendBuffer(frammento(CAMPIONI, 0));
+assert.ok(/decodifica ADTS: EncodingError/.test(S.presa.diagnosi()), S.presa.diagnosi());
+S.sb.appendBuffer(frammento(CAMPIONI, 4));
+assert.ok(!/EncodingError/.test(S.presa.diagnosi()), 'errore superato ancora in diagnosi: ' + S.presa.diagnosi());
+console.log('✓ errore passeggero: scompare dalla diagnosi quando la decodifica riprende');
 console.log('Tutte le prove della presa audio superate.');
