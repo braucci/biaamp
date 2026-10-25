@@ -31,17 +31,25 @@ function crea(opzioni = {}) {
   const log = [];
   const server = [];                        // chiamate che YouTube Music farebbe al server
   const videoEl = { paused: !!opzioni.inPausa, currentTime: 42, duration: 200, volume: 0.5, currentSrc: 'blob:x' };
+  // Volume come in YouTube Music: la barra tiene nello store il valore del cursore
+  // e passa al lettore il guadagno esponenziale Kfb (funzione copiata dal pacchetto
+  // music_polymer_inlined_html.js, opzione music_web_enable_exponential_volume_control).
+  const Kfb = (a) => Math.min(100, Math.max(0, Math.pow(2, 0.03917 * a + 2.82823) - 7.13431));
+  const volume = { cursore: 70, guadagno: Kfb(70) };
   const player = {
     stato: opzioni.inPausa ? 2 : 1,
     getPlayerState() { return this.stato; }, getCurrentTime() { return 42.5; }, getDuration() { return 245; },
-    getVolume() { return 70; }, isMuted() { return false; }, getVideoData() { return { video_id: 'abc123', title: 'T', author: 'A' }; },
+    getVolume() { return volume.guadagno; }, isMuted() { return false; }, getVideoData() { return { video_id: 'abc123', title: 'T', author: 'A' }; },
     playVideo() { log.push('playVideo'); }, pauseVideo() { log.push('pauseVideo'); }, seekTo(t) { log.push('seekTo:' + t); },
-    setVolume(v) { log.push('setVolume:' + v); }, unMute() {}, nextVideo() { log.push('nextVideo'); }, previousVideo() {},
+    setVolume(v) { log.push('setVolume:' + v); volume.guadagno = v; }, unMute() {}, nextVideo() { log.push('nextVideo'); }, previousVideo() {},
   };
   const el = (txt) => ({ textContent: txt });
   const barraEl = {
-    hasAttribute: (n) => n === 'shuffle-on', getState: () => ({ queue: { repeatMode: 'ALL' } }),
-    updateVolume(v) { log.push('updateVolume:' + v); }, onRepeatButtonClick() { log.push('repeat'); },
+    hasAttribute: (n) => n === 'shuffle-on',
+    getState: () => (opzioni.senzaVolumeStore ? { queue: { repeatMode: 'ALL' } }
+                                              : { queue: { repeatMode: 'ALL' }, player: { volume: volume.cursore } }),
+    updateVolume(v) { log.push('updateVolume:' + v); volume.cursore = v; volume.guadagno = Kfb(v); },
+    onRepeatButtonClick() { log.push('repeat'); },
     queue: { shuffle() { log.push('shuffle'); } },
     querySelector(sel) {
       if (sel.includes('.title')) return el('  Wish You  Were Here ');
@@ -150,7 +158,7 @@ function crea(opzioni = {}) {
   const window = { __biaPresa: presa };
   const btoa = (s) => Buffer.from(s, 'binary').toString('base64');
   new Function('window', 'document', 'btoa', 'location', sorgente)(window, document, btoa, location);
-  return { bia: window.__bia, log, presa, richieste, location, statoCoda, server, coda };
+  return { bia: window.__bia, log, presa, richieste, location, statoCoda, server, coda, player };
 }
 
 (async () => {
@@ -197,6 +205,21 @@ function crea(opzioni = {}) {
   a.bia.cmd('shuffle'); a.bia.cmd('repeat'); assert.ok(a.log.includes('shuffle') && a.log.includes('repeat'));
   assert.strictEqual(a.bia.cmd('inesistente'), false);
   console.log('✓ comandi');
+
+  // 4 bis. Volume: si rilegge sulla stessa scala su cui si scrive (cursore di
+  // YouTube Music), non il guadagno esponenziale del lettore.
+  a = crea();
+  for (const x of [42, 59, 17, 47, 0, 100]) {
+    a.bia.cmd('volume', x);
+    assert.strictEqual(JSON.parse(a.bia.stato('')).vol, x, 'volume ' + x + ' riletto come ' + JSON.parse(a.bia.stato('')).vol);
+  }
+  a.bia.cmd('volume', 42);
+  assert.ok(Math.abs(a.player.getVolume() - 15.08) < 0.05, 'guadagno del lettore ' + a.player.getVolume());
+  a = crea({ senzaVolumeStore: true });            // store non leggibile: scrittura e lettura sul lettore
+  a.bia.cmd('volume', 42);
+  assert.ok(a.log.includes('setVolume:42') && !a.log.some((x) => x.startsWith('updateVolume')), a.log.join());
+  assert.strictEqual(JSON.parse(a.bia.stato('')).vol, 42);
+  console.log('✓ volume: 42 → 42 (guadagno del lettore 15,1); senza store, setVolume/getVolume');
 
   // 5. Ricerca: richiesta '/search' con parametri; risposta ridotta a 'contents'.
   a = crea();
