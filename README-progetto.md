@@ -1,6 +1,6 @@
 # BiaAmp — Documentazione tecnica
 
-Versione 1.4.0 · © 2026 B. Raucci · Licenza MIT
+Versione 1.4.1 · © 2026 B. Raucci · Licenza MIT
 
 Questo documento descrive come è costruito BiaAmp, perché è costruito così, che cosa è
 stato verificato e come intervenire quando qualcosa non funziona.
@@ -110,12 +110,15 @@ collaudo ("analisi n/d"); nessuna impostazione di `WKWebView` lo aggira.
 
 La soluzione, suggerita nella stessa segnalazione, è **analizzare una copia dei dati**
 invece del suono in uscita. `presa.js` viene iniettato *all'inizio* della pagina, prima
-del lettore di YouTube, e avvolge in modo passivo tre funzioni del browser:
+del lettore di YouTube, e avvolge in modo passivo alcune funzioni del browser:
 
 1. `MediaSource.addSourceBuffer` — riconosce i buffer **audio** (tipo `audio/…`); quelli
    video non vengono toccati;
-2. `SourceBuffer.appendBuffer` — copia ogni segmento che il lettore vi carica;
-3. `URL.createObjectURL` — ricorda quale `MediaSource` è collegato a quale `<video>`, così
+2. `SourceBuffer.appendBuffer` — copia ogni segmento che il lettore vi carica, **dopo**
+   che il browser lo ha accettato;
+3. `SourceBuffer.abort`, `remove` e `changeType` — tengono la presa allineata al buffer
+   (§ 2.2.1);
+4. `URL.createObjectURL` — ricorda quale `MediaSource` è collegato a quale `<video>`, così
    al cambio brano non si mescolano i dati di due brani diversi.
 
 Per ogni segmento serve l'istante $t_0$ a cui corrisponde:
@@ -135,6 +138,58 @@ AAC leggendo `tfhd`/`trun` (dimensione di ciascun campione) e la configurazione 
 descrittore `esds`, e li **rincapsula in ADTS** (intestazione di 7 byte per fotogramma),
 formato che il decodificatore di sistema accetta sempre. Il metodo che funziona viene
 ricordato per i segmenti successivi.
+
+#### 2.2.1 Sessioni lunghe: allineamento della ricomposizione (1.4.1)
+
+**Il guasto.** Fino alla 1.4.0, dopo un tempo imprevedibile l'analisi poteva fermarsi
+per sempre (`analisi n/d: audio/mp4 · seg 299 · dec 299 · diretto`, nessun errore) e
+tornava solo riavviando. La ricomposizione dei riquadri MP4 è un automa che legge
+un'intestazione di 8 byte — dimensione $d$ (32 bit) e tipo (4 caratteri) — e attende
+$d$ byte. YouTube Music **riusa lo stesso `SourceBuffer` da un brano all'altro**. Se un
+segmento resta a metà, i byte in sospeso si saldano ai successivi e l'automa perde il
+passo. Un segmento resta a metà in due casi:
+
+- un salto di brano o una ricerca nel brano, con `abort()`, che azzera l'analizzatore
+  del browser ma non quello della presa;
+- un `appendBuffer` rifiutato per buffer pieno (`QuotaExceededError`), che il lettore
+  ripete e la presa contava due volte.
+
+Quattro byte qualsiasi letti come dimensione valgono in media $2^{31}$ byte ≈ 2 GB. La
+presa attendeva quei byte fino al tetto di sicurezza dell'accumulo, 16 MB. Con l'audio
+a 128 kbit/s (16 kB/s) l'attesa è $16 \cdot 2^{20}\ \text{B} / 16\,000\ \text{B/s}
+\approx 1050$ s ≈ 17 minuti; a 256 kbit/s circa 9 minuti. Poi la presa si
+azzerava con un errore, ma ripartiva da un pezzo qualsiasi e poteva perdere di nuovo
+il passo. Durante l'attesa il contatore dei segmenti resta fermo senza errori: è
+esattamente la diagnosi osservata.
+
+**La correzione** agisce su tre livelli indipendenti:
+
+1. *Prevenzione.* `abort()` e l'evento `error` azzerano anche la presa; i dati entrano
+   nella presa solo dopo che `appendBuffer` è riuscito; `changeType()` attende un nuovo
+   segmento di inizializzazione.
+2. *Rilevazione.* Un'intestazione è credibile solo se il tipo è un riquadro di primo
+   livello dell'MP4 frammentato (`moof`, `mdat`, `moov`, `ftyp`, `styp`, `sidx`, …) e se
+   $8 \le d \le 4$ MB. Un frammento audio di 10 s a 256 kbit/s occupa circa 320 kB, quindi
+   il limite ha un margine di oltre 10 volte.
+3. *Riaggancio.* Se l'intestazione non è credibile, la presa cerca la successiva firma
+   `moof`/`ftyp`/`styp`/`moov` preceduta da una dimensione plausibile e riparte da lì.
+   Gli ultimi 7 byte restano in attesa, perché la firma può arrivare spezzata tra due
+   pezzi. La diagnosi conta gli episodi (`riagganci N`).
+
+*Perché il riaggancio è affidabile.* Un falso aggancio richiede che in un punto qualsiasi
+dei dati compressi compaiano i 4 byte di una delle 4 firme e, prima di essi, una
+dimensione nell'intervallo ammesso. Per byte casuali la probabilità per posizione è
+$4 \cdot 256^{-4} \cdot (2^{22}/2^{32}) \approx 9 \cdot 10^{-13}$: su un frammento di
+320 kB si ha circa $3 \cdot 10^{-7}$. Anche in quel caso il passo successivo perde di
+nuovo l'allineamento e si riaggancia: l'errore si corregge da sé al frammento dopo.
+
+**Potatura dei blocchi.** I blocchi decodificati sono al massimo 40. Ora si tengono
+quelli del brano in ascolto (il `MediaSource` del `<video>` del lettore, non del primo
+`<video>` del documento). Quelli finiti da più di 15 s vengono scartati, salvo che siano
+arrivati da meno di 20 s: il lettore può accodare un brano prima di spostare l'istante di
+ascolto. Oltre il limite si sacrificano prima i blocchi di altri brani, poi quelli più
+lontani dall'istante di ascolto. `remove()` toglie anche dalla presa i blocchi del
+tratto liberato. A parità di copertura vale il blocco arrivato per ultimo.
 
 ### 2.3 Dal segnale allo spettro: replica di `AnalyserNode`
 
@@ -475,12 +530,12 @@ per la copia locale.
 | Livello | Strumento | Esito |
 |---|---|---|
 | Motore | `python3 core.py` | 573 verifiche superate, di cui una esaustiva su 1 793 spostamenti a blocco |
-| Presa audio | `node test/test_presa.js` | 10 prove: intervalli, MP4/WebM, `esds`, `trun`, ADTS, FFT contro DFT, `mdhd`/`tfdt` a 32 e 64 bit, MP4 rifiutato → ADTS, separazione tra brani, segmenti in pezzi da 7 byte con `timestampOffset`, buffer video ignorati |
+| Presa audio | `node test/test_presa.js` | 19 prove: intervalli, MP4/WebM, `esds`, `trun`, ADTS, FFT contro DFT, `mdhd`/`tfdt` a 32 e 64 bit, MP4 rifiutato → ADTS, separazione tra brani, segmenti in pezzi da 7 byte con `timestampOffset`, buffer video ignorati; sessioni lunghe (1.4.1): `abort()` a metà segmento, pezzo rifiutato e ripetuto, riaggancio (dimensione impossibile, tipo ignoto, firma spezzata), secondo `<video>` nel documento, limite dei blocchi, blocchi sovrapposti e `remove()`, diagnosi, errore passeggero. Ognuna delle 12 difese è verificata per mutazione: togliendola, almeno una prova fallisce |
 | Ponte | `node test/test_ponte.js` | 16 prove (gettone di continuazione compreso) contro una simulazione delle vie native ricavate dal codice di YouTube Music: stato, dati della presa, coda, comandi, ricerca, riproduci ora / in coda (radio reattiva spenta), coda vuota; segnaposto e radio, spostamento nativo (`REORDER` al server), componente in ritardo sullo store, ricerca per `videoId`, ripiego locale, rimozione nativa (`DELETE`), ripristino, fine della radio |
 | Codice di YouTube Music | lettura del pacchetto `music_polymer_inlined_html.js` (`af273e12`) in una pagina aperta con l'account del progetto, **senza modificare la coda** | riduttore di `MOVE_ITEM` (posizione finale), `removeItem` e `onDrop` con le chiamate al server, `UPDATE_ITEMS` della radio reattiva, `SET_IS_RAAR_ENABLED`, `SET_IS_INFINITE`; coda del server ripristinata in una pagina nuova |
 | Ricerca su dati reali | righe autentiche di una risposta di YouTube Music salvata da `ytmusicapi` | 11 righe su 11 riconosciute (titolo, artista, durata, identificativo) |
 | Interfaccia | `python3 test/banco.py` (AppKit simulato) | 142 verifiche: avvio, eventi, agganci, playlist modificabile (selezione, trascinamento, tastiera, menu, annullamento, letture superate, pagina che non conferma), riduzione a icona, pannello di ricerca, diagnosi, tre scale, menu; anteprime PNG |
-| Regole PyObjC e risorse | `python3 test/verifica_pyobjc.py` | 7 classi, 182 metodi conformi; risorse dichiarate |
+| Regole PyObjC e risorse | `python3 test/verifica_pyobjc.py` | 7 classi, 184 metodi conformi; risorse dichiarate |
 | Nomi delle API | metadati ufficiali di PyObjC 12.2.2 | costanti, firme dei blocchi e di `callAsyncJavaScript` confermate |
 
 **Verificato sul Mac.** 1.0.0: costruzione completa, portabilità del pacchetto, avvio,
@@ -491,7 +546,9 @@ WKWebView, registro «via nativa»; rimozioni persistenti sul server (i brani ri
 erano altri: la continuazione della radio). 1.3.1: gettone di continuazione tolto
 (la coda non si riempie più), spostamenti e «riproduci dopo» dalla ricerca. **Non ancora
 verificato (1.3.2):** la rimozione per indice con chiavi doppie, l'annullamento di una
-rimozione, la riduzione a icona.
+rimozione, la riduzione a icona. **Da verificare (1.4.1):** l'analisi in una sessione
+lunga con salti di brano. Il guasto della 1.4.0 compariva a caso dopo molti brani; la
+causa è stata ricostruita e riprodotta in simulazione, non osservata nel registro.
 La riga di stato, il piede della playlist e il registro sono predisposti per mostrare
 esattamente questi dati.
 
@@ -506,6 +563,9 @@ esattamente questi dati.
 | `analisi n/d: nessun flusso audio intercettato` | la presa non vede i `SourceBuffer` (pagina caricata prima della presa, o MSE in un *worker*) | `⌘R` ricarica la pagina; se resta, segnalare la riga |
 | `analisi n/d: audio/… · seg N · dec 0 · decodifica…` | WebKit non decodifica il formato ricevuto | segnalare la riga: indica il formato e l'errore esatti |
 | `analisi n/d: … · seg 0` | i segmenti arrivano ma non vengono ricomposti | segnalare la riga e il formato |
+| `analisi n/d: … · nessun blocco` | nessun segmento decodificato per il brano in ascolto; se `seg` resta fermo, i segmenti non arrivano più alla presa | attendere qualche secondo (riaggancio automatico); se resta, `⌘R` e segnalare le righe `presa audio:` del registro |
+| `analisi n/d: … · blocchi N fuori tempo` | i blocchi ci sono ma non coprono l'istante di ascolto | segnalare le righe `presa audio:` del registro con l'ora |
+| `… · riagganci N` (con l'analisi attiva) | la ricomposizione ha perso il passo N volte e si è riagganciata da sola | nessuno: è informativo |
 | Ricerca: `errore: …` | pagina non pronta o API cambiata | attendere il caricamento della Libreria; poi Web Inspector |
 | Brani tolti che ricompaiono | modifica rimasta locale: il server ha ancora la coda vecchia | nel registro deve comparire `via nativa`; con `via locale` l'interfaccia di YouTube Music è cambiata: console, `typeof document.querySelector('#queue').onDrop` e `typeof document.querySelector('#queue').queue.removeItem` |
 | La coda si allunga da sola dopo un cambio di brano | è una radio (piede: «radio») e dopo il corrente restano meno di 5 brani | togliere un brano la ferma; oppure menu della playlist ▸ *Ferma la radio* |

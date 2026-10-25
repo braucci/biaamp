@@ -3,6 +3,27 @@
 Formato: [Keep a Changelog](https://keepachangelog.com/it/1.1.0/) — versioni secondo
 [Semantic Versioning](https://semver.org/lang/it/).
 
+## [1.4.1] — 2026-10-25
+
+### Corretto
+- **L'analizzatore si fermava all'improvviso** («analisi n/d: audio/mp4 · seg N · dec N»,
+  senza errori) e tornava solo riavviando l'app. YouTube Music riusa lo stesso buffer
+  audio da un brano all'altro. Un segmento interrotto da un salto di brano (`abort()`) o
+  rifiutato per buffer pieno e poi ripetuto faceva perdere il passo alla ricomposizione
+  dei riquadri MP4, che restava in attesa di un riquadro inesistente. Ora la presa:
+  - si azzera con `abort()` e con gli errori del buffer;
+  - conta solo i dati accettati dal browser;
+  - riconosce un'intestazione incoerente (tipo ignoto o dimensione oltre 4 MB) e si
+    riaggancia al riquadro successivo.
+- La potatura dei blocchi usava il primo `<video>` del documento invece di quello del
+  lettore. Inoltre poteva scartare i blocchi del brano in ascolto a vantaggio di quelli
+  di brani precedenti.
+- Un errore passeggero restava per sempre nella diagnosi.
+
+### Aggiunto
+- La diagnosi dice perché manca l'analisi (`nessun blocco`, `blocchi N fuori tempo`) e
+  quante volte la presa si è riagganciata (`riagganci N`).
+
 ## [1.4.0] — 2026-10-24
 
 ### Aggiunto

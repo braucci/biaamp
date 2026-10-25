@@ -36,7 +36,7 @@ import tempfile
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 NOME_APP = "BiaAmp"
 ID_BUNDLE = "net.raucci.biaamp"
