@@ -3,6 +3,17 @@
 Formato: [Keep a Changelog](https://keepachangelog.com/it/1.1.0/) — versioni secondo
 [Semantic Versioning](https://semver.org/lang/it/).
 
+## [1.4.2] — 2026-10-25
+
+### Corretto
+- **Il cursore del volume tornava indietro** dopo il rilascio (42 % → 15 %, 59 % → 28 %).
+  YouTube Music ha due scale per il volume: il cursore, che resta nello store, e il
+  guadagno passato al lettore, legato al cursore da una curva esponenziale
+  $g(a) = 2^{0{,}03917\,a + 2{,}82823} - 7{,}13431$. BiaAmp scriveva sulla prima e
+  rileggeva la seconda (`getVolume()`). Ora scrittura e lettura usano la scala del
+  cursore (`getState().player.volume`); se lo store non è leggibile, entrambe passano dal
+  lettore.
+
 ## [1.4.1] — 2026-10-25
 
 ### Corretto

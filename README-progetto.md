@@ -1,6 +1,6 @@
 # BiaAmp — Documentazione tecnica
 
-Versione 1.4.1 · © 2026 B. Raucci · Licenza MIT
+Versione 1.4.2 · © 2026 B. Raucci · Licenza MIT
 
 Questo documento descrive come è costruito BiaAmp, perché è costruito così, che cosa è
 stato verificato e come intervenire quando qualcosa non funziona.
@@ -64,10 +64,24 @@ interni della pagina, gli stessi del client open source più diffuso
 
 | Dato o comando | Accesso | Ripiego |
 |---|---|---|
-| stato, posizione, durata, volume | `#movie_player.getPlayerState()`, `getCurrentTime()`, … | elemento `<video>` |
+| stato, posizione, durata | `#movie_player.getPlayerState()`, `getCurrentTime()`, … | elemento `<video>` |
 | play, pausa, posizione | `#movie_player.playVideo()`, `pauseVideo()`, `seekTo()` | — |
 | successivo / precedente | clic su `.next-button` / `.previous-button` | `nextVideo()` |
-| volume | `ytmusic-player-bar.updateVolume(v)` | `setVolume(v)` |
+| volume (scrittura e lettura) | `ytmusic-player-bar.updateVolume(a)` e `getState().player.volume` | `setVolume(v)` e `getVolume()` |
+
+**Il volume ha due scale.** Il cursore di YouTube Music lavora sulla scala percepita $a$
+(0…100). Con l'opzione `music_web_enable_exponential_volume_control`, attiva sul
+servizio, la barra passa al lettore un guadagno esponenziale:
+
+$$g(a) = 2^{\,0{,}03917\,a + 2{,}82823} - 7{,}13431 \quad (\text{limitato a } 0 \ldots 100),$$
+
+con $g(0) \approx 0$ e $g(100) \approx 100$. Il termine esponenziale cresce di un fattore
+$2^{0{,}3917} \approx 1{,}31$ ogni 10 punti di cursore, cioè raddoppia ogni
+$1/0{,}03917 \approx 25{,}5$ punti. È la legge «logaritmica» dei potenziometri audio, che
+rende uniforme il passo *percepito*. Lo store conserva $a$, il lettore $g(a)$. Fino alla 1.4.1 BiaAmp scriveva
+$a$ e rileggeva $g(a)$ con `getVolume()`, quindi il cursore tornava indietro dopo il
+rilascio: $42 \to 15$, $59 \to 28$. Dalla 1.4.2 scrittura e lettura stanno sullo stesso
+livello: lo store, se è leggibile, altrimenti il lettore.
 | ripetizione | `ytmusic-player-bar.getState().queue.repeatMode` → `NONE`/`ALL`/`ONE` | clic su `.repeat` |
 | casuale | attributo `shuffle-on`; `queue.shuffle()` | clic su `.shuffle` |
 | mi piace | attributo `like-status` di `#like-button-renderer` | `updateLikeStatus()` |
@@ -531,7 +545,7 @@ per la copia locale.
 |---|---|---|
 | Motore | `python3 core.py` | 573 verifiche superate, di cui una esaustiva su 1 793 spostamenti a blocco |
 | Presa audio | `node test/test_presa.js` | 19 prove: intervalli, MP4/WebM, `esds`, `trun`, ADTS, FFT contro DFT, `mdhd`/`tfdt` a 32 e 64 bit, MP4 rifiutato → ADTS, separazione tra brani, segmenti in pezzi da 7 byte con `timestampOffset`, buffer video ignorati; sessioni lunghe (1.4.1): `abort()` a metà segmento, pezzo rifiutato e ripetuto, riaggancio (dimensione impossibile, tipo ignoto, firma spezzata), secondo `<video>` nel documento, limite dei blocchi, blocchi sovrapposti e `remove()`, diagnosi, errore passeggero. Ognuna delle 12 difese è verificata per mutazione: togliendola, almeno una prova fallisce |
-| Ponte | `node test/test_ponte.js` | 16 prove (gettone di continuazione compreso) contro una simulazione delle vie native ricavate dal codice di YouTube Music: stato, dati della presa, coda, comandi, ricerca, riproduci ora / in coda (radio reattiva spenta), coda vuota; segnaposto e radio, spostamento nativo (`REORDER` al server), componente in ritardo sullo store, ricerca per `videoId`, ripiego locale, rimozione nativa (`DELETE`), ripristino, fine della radio |
+| Ponte | `node test/test_ponte.js` | 17 prove (gettone di continuazione e scala del volume compresi) contro una simulazione delle vie native ricavate dal codice di YouTube Music: stato, dati della presa, coda, comandi, ricerca, riproduci ora / in coda (radio reattiva spenta), coda vuota; segnaposto e radio, spostamento nativo (`REORDER` al server), componente in ritardo sullo store, ricerca per `videoId`, ripiego locale, rimozione nativa (`DELETE`), ripristino, fine della radio |
 | Codice di YouTube Music | lettura del pacchetto `music_polymer_inlined_html.js` (`af273e12`) in una pagina aperta con l'account del progetto, **senza modificare la coda** | riduttore di `MOVE_ITEM` (posizione finale), `removeItem` e `onDrop` con le chiamate al server, `UPDATE_ITEMS` della radio reattiva, `SET_IS_RAAR_ENABLED`, `SET_IS_INFINITE`; coda del server ripristinata in una pagina nuova |
 | Ricerca su dati reali | righe autentiche di una risposta di YouTube Music salvata da `ytmusicapi` | 11 righe su 11 riconosciute (titolo, artista, durata, identificativo) |
 | Interfaccia | `python3 test/banco.py` (AppKit simulato) | 142 verifiche: avvio, eventi, agganci, playlist modificabile (selezione, trascinamento, tastiera, menu, annullamento, letture superate, pagina che non conferma), riduzione a icona, pannello di ricerca, diagnosi, tre scale, menu; anteprime PNG |
